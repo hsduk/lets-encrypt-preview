@@ -1,10 +1,16 @@
 """Utilities for all Let's Encrypt."""
 import collections
 import errno
+import logging
 import os
+import re
+import subprocess
 import stat
 
 from letsencrypt import errors
+
+
+logger = logging.getLogger(__name__)
 
 
 Key = collections.namedtuple("Key", "file pem")
@@ -12,14 +18,75 @@ Key = collections.namedtuple("Key", "file pem")
 CSR = collections.namedtuple("CSR", "file data form")
 
 
-def make_or_verify_dir(directory, mode=0o755, uid=0):
+# ANSI SGR escape codes
+# Formats text as bold or with increased intensity
+ANSI_SGR_BOLD = '\033[1m'
+# Colors text red
+ANSI_SGR_RED = "\033[31m"
+# Resets output format
+ANSI_SGR_RESET = "\033[0m"
+
+
+def run_script(params):
+    """Run the script with the given params.
+
+    :param list params: List of parameters to pass to Popen
+
+    """
+    try:
+        proc = subprocess.Popen(params,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+
+    except (OSError, ValueError):
+        msg = "Unable to run the command: %s" % " ".join(params)
+        logger.error(msg)
+        raise errors.SubprocessError(msg)
+
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode != 0:
+        msg = "Error while running %s.\n%s\n%s" % (
+            " ".join(params), stdout, stderr)
+        # Enter recovery routine...
+        logger.error(msg)
+        raise errors.SubprocessError(msg)
+
+    return stdout, stderr
+
+
+def exe_exists(exe):
+    """Determine whether path/name refers to an executable.
+
+    :param str exe: Executable path or name
+
+    :returns: If exe is a valid executable
+    :rtype: bool
+
+    """
+    def is_exe(path):
+        """Determine if path is an exe."""
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    path, _ = os.path.split(exe)
+    if path:
+        return is_exe(exe)
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            if is_exe(os.path.join(path, exe)):
+                return True
+
+    return False
+
+
+def make_or_verify_dir(directory, mode=0o755, uid=0, strict=False):
     """Make sure directory exists with proper permissions.
 
     :param str directory: Path to a directory.
     :param int mode: Directory mode.
     :param int uid: Directory owner.
 
-    :raises LetsEncryptClientError: if a directory already exists,
+    :raises .errors.Error: if a directory already exists,
         but has wrong permissions or owner
 
     :raises OSError: if invalid or inaccessible file names and
@@ -31,10 +98,10 @@ def make_or_verify_dir(directory, mode=0o755, uid=0):
         os.makedirs(directory, mode)
     except OSError as exception:
         if exception.errno == errno.EEXIST:
-            if not check_permissions(directory, mode, uid):
-                raise errors.LetsEncryptClientError(
-                    "%s exists, but does not have the proper "
-                    "permissions or owner" % directory)
+            if strict and not check_permissions(directory, mode, uid):
+                raise errors.Error(
+                    "%s exists, but it should be owned by user %d with"
+                    "permissions %s" % (directory, uid, oct(mode)))
         else:
             raise
 
@@ -54,16 +121,30 @@ def check_permissions(filepath, mode, uid=0):
     return stat.S_IMODE(file_stat.st_mode) == mode and file_stat.st_uid == uid
 
 
-def _safely_attempt_open(fname, mode):
-    file_d = os.open(fname, os.O_CREAT | os.O_EXCL | os.O_RDWR, mode)
-    return os.fdopen(file_d, "w"), fname
+def safe_open(path, mode="w", chmod=None, buffering=None):
+    """Safely open a file.
+
+    :param str path: Path to a file.
+    :param str mode: Same os `mode` for `open`.
+    :param int chmod: Same as `mode` for `os.open`, uses Python defaults
+        if ``None``.
+    :param int buffering: Same as `bufsize` for `os.fdopen`, uses Python
+        defaults if ``None``.
+
+    """
+    # pylint: disable=star-args
+    open_args = () if chmod is None else (chmod,)
+    fdopen_args = () if buffering is None else (buffering,)
+    return os.fdopen(
+        os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, *open_args),
+        mode, *fdopen_args)
 
 
 def _unique_file(path, filename_pat, count, mode):
     while True:
+        current_path = os.path.join(path, filename_pat(count))
         try:
-            return _safely_attempt_open(
-                os.path.join(path, filename_pat(count)), mode)
+            return safe_open(current_path, chmod=mode), current_path
         except OSError as err:
             # "File exists," is okay, try a different name.
             if err.errno != errno.EEXIST:
@@ -101,9 +182,9 @@ def unique_lineage_name(path, filename, mode=0o777):
         specified location.
 
     """
+    preferred_path = os.path.join(path, "%s.conf" % (filename))
     try:
-        return _safely_attempt_open(
-            os.path.join(path, "%s.conf" % (filename)), mode=mode)
+        return safe_open(preferred_path, chmod=mode), preferred_path
     except OSError as err:
         if err.errno != errno.EEXIST:
             raise
@@ -119,3 +200,18 @@ def safely_remove(path):
     except OSError as err:
         if err.errno != errno.ENOENT:
             raise
+
+
+# Just make sure we don't get pwned... Make sure that it also doesn't
+# start with a period or have two consecutive periods <- this needs to
+# be done in addition to the regex
+EMAIL_REGEX = re.compile("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+$")
+
+
+def safe_email(email):
+    """Scrub email address before using it."""
+    if EMAIL_REGEX.match(email) is not None:
+        return not email.startswith(".") and ".." not in email
+    else:
+        logger.warn("Invalid email address: %s.", email)
+        return False

@@ -8,11 +8,11 @@ import zope.interface
 from letsencrypt import errors
 from letsencrypt import interfaces
 
-from letsencrypt.plugins.standalone import authenticator
+from letsencrypt.plugins import standalone
 
 EP_SA = pkg_resources.EntryPoint(
-    "sa", "letsencrypt.plugins.standalone.authenticator",
-    attrs=("StandaloneAuthenticator",),
+    "sa", "letsencrypt.plugins.standalone",
+    attrs=("Authenticator",),
     dist=mock.MagicMock(key="letsencrypt"))
 
 
@@ -50,7 +50,9 @@ class PluginEntryPointTest(unittest.TestCase):
                 name, PluginEntryPoint.entry_point_to_plugin_name(entry_point))
 
     def test_description(self):
-        self.assertEqual("Standalone Authenticator", self.plugin_ep.description)
+        self.assertEqual(
+                "Automatically configure and run a simple webserver",
+                self.plugin_ep.description)
 
     def test_description_with_name(self):
         self.plugin_ep.plugin_cls = mock.MagicMock(description="Desc")
@@ -68,11 +70,11 @@ class PluginEntryPointTest(unittest.TestCase):
         self.assertFalse(self.plugin_ep.prepared)
         self.assertFalse(self.plugin_ep.misconfigured)
         self.assertFalse(self.plugin_ep.available)
+        self.assertTrue(self.plugin_ep.problem is None)
         self.assertTrue(self.plugin_ep.entry_point is EP_SA)
         self.assertEqual("sa", self.plugin_ep.name)
 
-        self.assertTrue(
-            self.plugin_ep.plugin_cls is authenticator.StandaloneAuthenticator)
+        self.assertTrue(self.plugin_ep.plugin_cls is standalone.Authenticator)
 
     def test_init(self):
         config = mock.MagicMock()
@@ -101,6 +103,7 @@ class PluginEntryPointTest(unittest.TestCase):
         with mock.patch("letsencrypt.plugins."
                         "disco.zope.interface") as mock_zope:
             mock_zope.exceptions = exceptions
+
             def verify_object(iface, obj):  # pylint: disable=missing-docstring
                 assert obj is plugin
                 assert iface is iface1 or iface is iface2 or iface is iface3
@@ -124,22 +127,34 @@ class PluginEntryPointTest(unittest.TestCase):
 
     def test_prepare_misconfigured(self):
         plugin = mock.MagicMock()
-        plugin.prepare.side_effect = errors.LetsEncryptMisconfigurationError
+        plugin.prepare.side_effect = errors.MisconfigurationError
         # pylint: disable=protected-access
         self.plugin_ep._initialized = plugin
         self.assertTrue(isinstance(self.plugin_ep.prepare(),
-                                   errors.LetsEncryptMisconfigurationError))
+                                   errors.MisconfigurationError))
         self.assertTrue(self.plugin_ep.prepared)
         self.assertTrue(self.plugin_ep.misconfigured)
+        self.assertTrue(isinstance(self.plugin_ep.problem,
+                                   errors.MisconfigurationError))
         self.assertTrue(self.plugin_ep.available)
 
     def test_prepare_no_installation(self):
         plugin = mock.MagicMock()
-        plugin.prepare.side_effect = errors.LetsEncryptNoInstallationError
+        plugin.prepare.side_effect = errors.NoInstallationError
         # pylint: disable=protected-access
         self.plugin_ep._initialized = plugin
         self.assertTrue(isinstance(self.plugin_ep.prepare(),
-                                   errors.LetsEncryptNoInstallationError))
+                                   errors.NoInstallationError))
+        self.assertTrue(self.plugin_ep.prepared)
+        self.assertFalse(self.plugin_ep.misconfigured)
+        self.assertFalse(self.plugin_ep.available)
+
+    def test_prepare_generic_plugin_error(self):
+        plugin = mock.MagicMock()
+        plugin.prepare.side_effect = errors.PluginError
+        # pylint: disable=protected-access
+        self.plugin_ep._initialized = plugin
+        self.assertTrue(isinstance(self.plugin_ep.prepare(), errors.PluginError))
         self.assertTrue(self.plugin_ep.prepared)
         self.assertFalse(self.plugin_ep.misconfigured)
         self.assertFalse(self.plugin_ep.available)
@@ -163,8 +178,7 @@ class PluginsRegistryTest(unittest.TestCase):
         with mock.patch("letsencrypt.plugins.disco.pkg_resources") as mock_pkg:
             mock_pkg.iter_entry_points.return_value = iter([EP_SA])
             plugins = PluginsRegistry.find_all()
-        self.assertTrue(plugins["sa"].plugin_cls
-                        is authenticator.StandaloneAuthenticator)
+        self.assertTrue(plugins["sa"].plugin_cls is standalone.Authenticator)
         self.assertTrue(plugins["sa"].entry_point is EP_SA)
 
     def test_getitem(self):

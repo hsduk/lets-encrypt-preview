@@ -3,12 +3,19 @@ import itertools
 import logging
 import time
 
+import zope.component
+
 from acme import challenges
-from acme import messages2
+from acme import messages
 
 from letsencrypt import achallenges
 from letsencrypt import constants
 from letsencrypt import errors
+from letsencrypt import error_handler
+from letsencrypt import interfaces
+
+
+logger = logging.getLogger(__name__)
 
 
 class AuthHandler(object):
@@ -22,25 +29,23 @@ class AuthHandler(object):
         :class:`~acme.challenges.ContinuityChallenge` types
     :type cont_auth: :class:`letsencrypt.interfaces.IAuthenticator`
 
-    :ivar network: Network object for sending and receiving authorization
-        messages
-    :type network: :class:`letsencrypt.network2.Network`
+    :ivar acme.client.Client acme: ACME client API.
 
     :ivar account: Client's Account
     :type account: :class:`letsencrypt.account.Account`
 
     :ivar dict authzr: ACME Authorization Resource dict where keys are domains
-        and values are :class:`acme.messages2.AuthorizationResource`
+        and values are :class:`acme.messages.AuthorizationResource`
     :ivar list dv_c: DV challenges in the form of
         :class:`letsencrypt.achallenges.AnnotatedChallenge`
     :ivar list cont_c: Continuity challenges in the
         form of :class:`letsencrypt.achallenges.AnnotatedChallenge`
 
     """
-    def __init__(self, dv_auth, cont_auth, network, account):
+    def __init__(self, dv_auth, cont_auth, acme, account):
         self.dv_auth = dv_auth
         self.cont_auth = cont_auth
-        self.network = network
+        self.acme = acme
 
         self.account = account
         self.authzr = dict()
@@ -60,20 +65,20 @@ class AuthHandler(object):
             form of (`completed`, `failed`)
         :rtype: tuple
 
-        :raises AuthorizationError: If unable to retrieve all
+        :raises .AuthorizationError: If unable to retrieve all
             authorizations
 
         """
         for domain in domains:
-            self.authzr[domain] = self.network.request_domain_challenges(
-                domain, self.account.new_authzr_uri)
+            self.authzr[domain] = self.acme.request_domain_challenges(
+                domain, self.account.regr.new_authzr_uri)
 
         self._choose_challenges(domains)
 
         # While there are still challenges remaining...
         while self.dv_c or self.cont_c:
             cont_resp, dv_resp = self._solve_challenges()
-            logging.info("Waiting for verification...")
+            logger.info("Waiting for verification...")
 
             # Send all Responses - this modifies dv_c and cont_c
             self._respond(cont_resp, dv_resp, best_effort)
@@ -82,11 +87,11 @@ class AuthHandler(object):
         self.verify_authzr_complete()
         # Only return valid authorizations
         return [authzr for authzr in self.authzr.values()
-                if authzr.body.status == messages2.STATUS_VALID]
+                if authzr.body.status == messages.STATUS_VALID]
 
     def _choose_challenges(self, domains):
         """Retrieve necessary challenges to satisfy server."""
-        logging.info("Performing the following challenges:")
+        logger.info("Performing the following challenges:")
         for dom in domains:
             path = gen_challenge_path(
                 self.authzr[dom].body.challenges,
@@ -102,17 +107,16 @@ class AuthHandler(object):
         """Get Responses for challenges from authenticators."""
         cont_resp = []
         dv_resp = []
-        try:
-            if self.cont_c:
-                cont_resp = self.cont_auth.perform(self.cont_c)
-            if self.dv_c:
-                dv_resp = self.dv_auth.perform(self.dv_c)
-        # This will catch both specific types of errors.
-        except errors.AuthorizationError:
-            logging.critical("Failure in setting up challenges.")
-            logging.info("Attempting to clean up outstanding challenges...")
-            self._cleanup_challenges()
-            raise
+        with error_handler.ErrorHandler(self._cleanup_challenges):
+            try:
+                if self.cont_c:
+                    cont_resp = self.cont_auth.perform(self.cont_c)
+                if self.dv_c:
+                    dv_resp = self.dv_auth.perform(self.dv_c)
+            except errors.AuthorizationError:
+                logger.critical("Failure in setting up challenges.")
+                logger.info("Attempting to clean up outstanding challenges...")
+                raise
 
         assert len(cont_resp) == len(self.cont_c)
         assert len(dv_resp) == len(self.dv_c)
@@ -134,9 +138,11 @@ class AuthHandler(object):
             self._send_responses(self.cont_c, cont_resp, chall_update))
 
         # Check for updated status...
-        self._poll_challenges(chall_update, best_effort)
-        # This removes challenges from self.dv_c and self.cont_c
-        self._cleanup_challenges(active_achalls)
+        try:
+            self._poll_challenges(chall_update, best_effort)
+        finally:
+            # This removes challenges from self.dv_c and self.cont_c
+            self._cleanup_challenges(active_achalls)
 
     def _send_responses(self, achalls, resps, chall_update):
         """Send responses and make sure errors are handled.
@@ -147,10 +153,16 @@ class AuthHandler(object):
         """
         active_achalls = []
         for achall, resp in itertools.izip(achalls, resps):
+            # This line needs to be outside of the if block below to
+            # ensure failed challenges are cleaned up correctly
+            active_achalls.append(achall)
+
             # Don't send challenges for None and False authenticator responses
-            if resp:
-                self.network.answer_challenge(achall.challb, resp)
-                active_achalls.append(achall)
+            if resp is not None and resp:
+                self.acme.answer_challenge(achall.challb, resp)
+                # TODO: answer_challenge returns challr, with URI,
+                # that can be used in _find_updated_challr
+                # comparisons...
                 if achall.domain in chall_update:
                     chall_update[achall.domain].append(achall)
                 else:
@@ -168,23 +180,28 @@ class AuthHandler(object):
         while dom_to_check and rounds < max_rounds:
             # TODO: Use retry-after...
             time.sleep(min_sleep)
+            all_failed_achalls = set()
             for domain in dom_to_check:
-                comp_challs, failed_challs = self._handle_check(
+                comp_achalls, failed_achalls = self._handle_check(
                     domain, chall_update[domain])
 
-                if len(comp_challs) == len(chall_update[domain]):
+                if len(comp_achalls) == len(chall_update[domain]):
                     comp_domains.add(domain)
-                elif not failed_challs:
-                    for chall in comp_challs:
-                        chall_update[domain].remove(chall)
+                elif not failed_achalls:
+                    for achall, _ in comp_achalls:
+                        chall_update[domain].remove(achall)
                 # We failed some challenges... damage control
                 else:
                     # Right now... just assume a loss and carry on...
                     if best_effort:
                         comp_domains.add(domain)
                     else:
-                        raise errors.AuthorizationError(
-                            "Failed Authorization procedure for %s" % domain)
+                        all_failed_achalls.update(
+                            updated for _, updated in failed_achalls)
+
+            if all_failed_achalls:
+                _report_failed_challs(all_failed_achalls)
+                raise errors.FailedChallenges(all_failed_achalls)
 
             dom_to_check -= comp_domains
             comp_domains.clear()
@@ -195,39 +212,38 @@ class AuthHandler(object):
         completed = []
         failed = []
 
-        self.authzr[domain], _ = self.network.poll(self.authzr[domain])
-        if self.authzr[domain].body.status == messages2.STATUS_VALID:
+        self.authzr[domain], _ = self.acme.poll(self.authzr[domain])
+        if self.authzr[domain].body.status == messages.STATUS_VALID:
             return achalls, []
 
         # Note: if the whole authorization is invalid, the individual failed
         #     challenges will be determined here...
         for achall in achalls:
-            status = self._get_chall_status(self.authzr[domain], achall)
+            updated_achall = achall.update(challb=self._find_updated_challb(
+                self.authzr[domain], achall))
 
             # This does nothing for challenges that have yet to be decided yet.
-            if status == messages2.STATUS_VALID:
-                completed.append(achall)
-            elif status == messages2.STATUS_INVALID:
-                failed.append(achall)
+            if updated_achall.status == messages.STATUS_VALID:
+                completed.append((achall, updated_achall))
+            elif updated_achall.status == messages.STATUS_INVALID:
+                failed.append((achall, updated_achall))
 
         return completed, failed
 
-    def _get_chall_status(self, authzr, achall):  # pylint: disable=no-self-use
-        """Get the status of the challenge.
+    def _find_updated_challb(self, authzr, achall):  # pylint: disable=no-self-use
+        """Find updated challenge body within Authorization Resource.
 
         .. warning:: This assumes only one instance of type of challenge in
             each challenge resource.
 
-        :param authzr: Authorization Resource
-        :type authzr: :class:`acme.messages2.AuthorizationResource`
-
-        :param achall: Annotated challenge for which to get status
-        :type achall: :class:`letsencrypt.achallenges.AnnotatedChallenge`
+        :param .AuthorizationResource authzr: Authorization Resource
+        :param .AnnotatedChallenge achall: Annotated challenge for which
+            to get status
 
         """
         for authzr_challb in authzr.body.challenges:
-            if type(authzr_challb.chall) is type(achall.challb.chall):
-                return authzr_challb.status
+            if type(authzr_challb.chall) is type(achall.challb.chall):  # noqa
+                return authzr_challb
         raise errors.AuthorizationError(
             "Target challenge not found in authorization resource")
 
@@ -249,7 +265,7 @@ class AuthHandler(object):
         If achall_list is not provided, cleanup all achallenges.
 
         """
-        logging.info("Cleaning up challenges")
+        logger.info("Cleaning up challenges")
 
         if achall_list is None:
             dv_c = self.dv_c
@@ -277,8 +293,8 @@ class AuthHandler(object):
 
         """
         for authzr in self.authzr.values():
-            if (authzr.body.status != messages2.STATUS_VALID and
-                    authzr.body.status != messages2.STATUS_INVALID):
+            if (authzr.body.status != messages.STATUS_VALID and
+                    authzr.body.status != messages.STATUS_INVALID):
                 raise errors.AuthorizationError("Incomplete authorizations")
 
     def _challenge_factory(self, domain, path):
@@ -294,8 +310,7 @@ class AuthHandler(object):
             :class:`letsencrypt.achallenges.Indexed`
         :rtype: tuple
 
-        :raises errors.LetsEncryptClientError: If Challenge type is not
-            recognized
+        :raises .errors.Error: if challenge type is not recognized
 
         """
         dv_chall = []
@@ -315,15 +330,11 @@ class AuthHandler(object):
         return cont_chall, dv_chall
 
 
-def challb_to_achall(challb, key, domain):
+def challb_to_achall(challb, account_key, domain):
     """Converts a ChallengeBody object to an AnnotatedChallenge.
 
-    :param challb: ChallengeBody
-    :type challb: :class:`acme.messages2.ChallengeBody`
-
-    :param key: Key
-    :type key: :class:`letsencrypt.le_util.Key`
-
+    :param .ChallengeBody challb: ChallengeBody
+    :param .JWK account_key: Authorized Account Key
     :param str domain: Domain of the challb
 
     :returns: Appropriate AnnotatedChallenge
@@ -331,35 +342,26 @@ def challb_to_achall(challb, key, domain):
 
     """
     chall = challb.chall
+    logger.info("%s challenge for %s", chall.typ, domain)
 
     if isinstance(chall, challenges.DVSNI):
-        logging.info("  DVSNI challenge for %s.", domain)
         return achallenges.DVSNI(
-            challb=challb, domain=domain, key=key)
-    elif isinstance(chall, challenges.SimpleHTTPS):
-        logging.info("  SimpleHTTPS challenge for %s.", domain)
-        return achallenges.SimpleHTTPS(
-            challb=challb, domain=domain, key=key)
+            challb=challb, domain=domain, account_key=account_key)
+    elif isinstance(chall, challenges.SimpleHTTP):
+        return achallenges.SimpleHTTP(
+            challb=challb, domain=domain, account_key=account_key)
     elif isinstance(chall, challenges.DNS):
-        logging.info("  DNS challenge for %s.", domain)
         return achallenges.DNS(challb=challb, domain=domain)
-
-    elif isinstance(chall, challenges.RecoveryToken):
-        logging.info("  Recovery Token Challenge for %s.", domain)
-        return achallenges.RecoveryToken(challb=challb, domain=domain)
     elif isinstance(chall, challenges.RecoveryContact):
-        logging.info("  Recovery Contact Challenge for %s.", domain)
         return achallenges.RecoveryContact(
             challb=challb, domain=domain)
     elif isinstance(chall, challenges.ProofOfPossession):
-        logging.info("  Proof-of-Possession Challenge for %s", domain)
         return achallenges.ProofOfPossession(
             challb=challb, domain=domain)
 
     else:
-        raise errors.LetsEncryptClientError(
-            "Received unsupported challenge of type: %s",
-            chall.typ)
+        raise errors.Error(
+            "Received unsupported challenge of type: %s", chall.typ)
 
 
 def gen_challenge_path(challbs, preferences, combinations):
@@ -368,8 +370,8 @@ def gen_challenge_path(challbs, preferences, combinations):
     .. todo:: This can be possibly be rewritten to use resolved_combinations.
 
     :param tuple challbs: A tuple of challenges
-        (:class:`acme.messages2.Challenge`) from
-        :class:`acme.messages2.AuthorizationResource` to be
+        (:class:`acme.messages.Challenge`) from
+        :class:`acme.messages.AuthorizationResource` to be
         fulfilled by the client in order to prove possession of the
         identifier.
 
@@ -428,7 +430,7 @@ def _find_smart_path(challbs, preferences, combinations):
     if not best_combo:
         msg = ("Client does not support any combination of challenges that "
                "will satisfy the CA.")
-        logging.fatal(msg)
+        logger.fatal(msg)
         raise errors.AuthorizationError(msg)
 
     return best_combo
@@ -480,3 +482,81 @@ def is_preferred(offered_challb, satisfied,
                 different=True):
             return False
     return True
+
+
+_ERROR_HELP_COMMON = (
+    "To fix these errors, please make sure that your domain name was entered "
+    "correctly and the DNS A record(s) for that domain contains the "
+    "right IP address.")
+
+
+_ERROR_HELP = {
+    "connection":
+        _ERROR_HELP_COMMON + " Additionally, please check that your computer "
+        "has publicly routable IP address and no firewalls are preventing the "
+        "server from communicating with the client.",
+    "dnssec":
+        _ERROR_HELP_COMMON + " Additionally, if you have DNSSEC enabled for "
+        "your domain, please ensure the signature is valid.",
+    "malformed":
+        "To fix these errors, please make sure that you did not provide any "
+        "invalid information to the client and try running Let's Encrypt "
+        "again.",
+    "serverInternal":
+        "Unfortunately, an error on the ACME server prevented you from completing "
+        "authorization. Please try again later.",
+    "tls":
+        _ERROR_HELP_COMMON + " Additionally, please check that you have an up "
+        "to date TLS configuration that allows the server to communicate with "
+        "the Let's Encrypt client.",
+    "unauthorized": _ERROR_HELP_COMMON,
+    "unknownHost": _ERROR_HELP_COMMON,
+}
+
+
+def _report_failed_challs(failed_achalls):
+    """Notifies the user about failed challenges.
+
+    :param set failed_achalls: A set of failed
+        :class:`letsencrypt.achallenges.AnnotatedChallenge`.
+
+    """
+    problems = dict()
+    for achall in failed_achalls:
+        if achall.error:
+            problems.setdefault(achall.error.typ, []).append(achall)
+
+    reporter = zope.component.getUtility(interfaces.IReporter)
+    for achalls in problems.itervalues():
+        reporter.add_message(
+            _generate_failed_chall_msg(achalls), reporter.MEDIUM_PRIORITY)
+
+
+def _generate_failed_chall_msg(failed_achalls):
+    """Creates a user friendly error message about failed challenges.
+
+    :param list failed_achalls: A list of failed
+        :class:`letsencrypt.achallenges.AnnotatedChallenge` with the same error
+        type.
+
+    :returns: A formatted error message for the client.
+    :rtype: str
+
+    """
+    typ = failed_achalls[0].error.typ
+    msg = [
+        "The following '{0}' errors were reported by the server:".format(typ)]
+
+    problems = dict()
+    for achall in failed_achalls:
+        problems.setdefault(achall.error.description, set()).add(achall.domain)
+    for problem in problems:
+        msg.append("\n\nDomains: ")
+        msg.append(", ".join(sorted(problems[problem])))
+        msg.append("\nError: {0}".format(problem))
+
+    if typ in _ERROR_HELP:
+        msg.append("\n\n")
+        msg.append(_ERROR_HELP[typ])
+
+    return "".join(msg)

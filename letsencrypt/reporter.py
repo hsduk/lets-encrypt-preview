@@ -9,6 +9,10 @@ import textwrap
 import zope.interface
 
 from letsencrypt import interfaces
+from letsencrypt import le_util
+
+
+logger = logging.getLogger(__name__)
 
 
 class Reporter(object):
@@ -27,14 +31,12 @@ class Reporter(object):
     LOW_PRIORITY = 2
     """Low priority constant. See `add_message`."""
 
-    _RESET = '\033[0m'
-    _BOLD = '\033[1m'
     _msg_type = collections.namedtuple('ReporterMsg', 'priority text on_crash')
 
     def __init__(self):
         self.messages = Queue.PriorityQueue()
 
-    def add_message(self, msg, priority, on_crash=False):
+    def add_message(self, msg, priority, on_crash=True):
         """Adds msg to the list of messages to be printed.
 
         :param str msg: Message to be displayed to the user.
@@ -48,7 +50,7 @@ class Reporter(object):
         """
         assert self.HIGH_PRIORITY <= priority <= self.LOW_PRIORITY
         self.messages.put(self._msg_type(priority, msg, on_crash))
-        logging.info("Reporting to user: %s", msg)
+        logger.info("Reporting to user: %s", msg)
 
     def atexit_print_messages(self, pid=os.getpid()):
         """Function to be registered with atexit to print messages.
@@ -66,22 +68,30 @@ class Reporter(object):
 
         If there is an unhandled exception, only messages for which
         ``on_crash`` is ``True`` are printed.
-"""
+
+        """
         bold_on = False
         if not self.messages.empty():
             no_exception = sys.exc_info()[0] is None
             bold_on = sys.stdout.isatty()
             if bold_on:
-                print self._BOLD
+                print le_util.ANSI_SGR_BOLD
             print 'IMPORTANT NOTES:'
-            wrapper = textwrap.TextWrapper(initial_indent=' - ',
-                                           subsequent_indent=(' ' * 3))
+            first_wrapper = textwrap.TextWrapper(
+                initial_indent=' - ', subsequent_indent=(' ' * 3))
+            next_wrapper = textwrap.TextWrapper(
+                initial_indent=first_wrapper.subsequent_indent,
+                subsequent_indent=first_wrapper.subsequent_indent)
         while not self.messages.empty():
             msg = self.messages.get()
             if no_exception or msg.on_crash:
                 if bold_on and msg.priority > self.HIGH_PRIORITY:
-                    sys.stdout.write(self._RESET)
+                    sys.stdout.write(le_util.ANSI_SGR_RESET)
                     bold_on = False
-                print wrapper.fill(msg.text)
+                lines = msg.text.splitlines()
+                print first_wrapper.fill(lines[0])
+                if len(lines) > 1:
+                    print "\n".join(
+                        next_wrapper.fill(line) for line in lines[1:])
         if bold_on:
-            sys.stdout.write(self._RESET)
+            sys.stdout.write(le_util.ANSI_SGR_RESET)

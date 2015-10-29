@@ -76,7 +76,7 @@ class NcursesDisplay(object):
             "help_label": help_label,
             "width": self.width,
             "height": self.height,
-            "menu_height": self.height-6,
+            "menu_height": self.height - 6,
         }
 
         # Can accept either tuples or just the actual choices
@@ -315,7 +315,7 @@ class FileDisplay(object):
             if index < 1 or index > len(tags):
                 return []
         # Transform indices to appropriate tags
-        return [tags[index-1] for index in indices]
+        return [tags[index - 1] for index in indices]
 
     def _print_menu(self, message, choices):
         """Print a menu on the screen.
@@ -409,6 +409,7 @@ def separate_list_input(input_):
     """
     no_commas = input_.replace(",", " ")
     # Each string is naturally unicode, this causes problems with M2Crypto SANs
+    # TODO: check if above is still true when M2Crypto is gone ^
     return [str(string) for string in no_commas.split()]
 
 

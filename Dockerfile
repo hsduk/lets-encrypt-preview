@@ -1,4 +1,4 @@
-# https://github.com/letsencrypt/lets-encrypt-preview/pull/431#issuecomment-103659297
+# https://github.com/letsencrypt/letsencrypt/pull/431#issuecomment-103659297
 # it is more likely developers will already have ubuntu:trusty rather
 # than e.g. debian:jessie and image size differences are negligible
 FROM ubuntu:trusty
@@ -44,12 +44,17 @@ COPY setup.py README.rst CHANGES.rst MANIFEST.in /opt/letsencrypt/src/
 
 COPY letsencrypt /opt/letsencrypt/src/letsencrypt/
 COPY acme /opt/letsencrypt/src/acme/
-COPY letsencrypt_apache /opt/letsencrypt/src/letsencrypt_apache/
-COPY letsencrypt_nginx /opt/letsencrypt/src/letsencrypt_nginx/
+COPY letsencrypt-apache /opt/letsencrypt/src/letsencrypt-apache/
+COPY letsencrypt-nginx /opt/letsencrypt/src/letsencrypt-nginx/
 
 
+# requirements.txt not installed!
 RUN virtualenv --no-site-packages -p python2 /opt/letsencrypt/venv && \
-    /opt/letsencrypt/venv/bin/pip install -e /opt/letsencrypt/src
+    /opt/letsencrypt/venv/bin/pip install \
+    -e /opt/letsencrypt/src/acme \
+    -e /opt/letsencrypt/src \
+    -e /opt/letsencrypt/src/letsencrypt-apache \
+    -e /opt/letsencrypt/src/letsencrypt-nginx
 
 # install in editable mode (-e) to save space: it's not possible to
 # "rm -rf /opt/letsencrypt/src" (it's stays in the underlaying image);
@@ -57,5 +62,5 @@ RUN virtualenv --no-site-packages -p python2 /opt/letsencrypt/venv && \
 # bash" and investigate, apply patches, etc.
 
 ENV PATH /opt/letsencrypt/venv/bin:$PATH
-# TODO: is --text really necessary?
-ENTRYPOINT [ "letsencrypt", "--text" ]
+
+ENTRYPOINT [ "letsencrypt" ]

@@ -5,15 +5,18 @@ import os
 import zope.component
 
 from letsencrypt import interfaces
+from letsencrypt import le_util
 from letsencrypt.display import util as display_util
 
 
+logger = logging.getLogger(__name__)
+
 # Define a helper function to avoid verbose code
-util = zope.component.getUtility  # pylint: disable=invalid-name
+util = zope.component.getUtility
 
 
 def choose_plugin(prepared, question):
-    """Allow the user to choose ther plugin.
+    """Allow the user to choose their plugin.
 
     :param list prepared: List of `~.PluginEntryPoint`.
     :param str question: Question to be presented to the user.
@@ -22,8 +25,8 @@ def choose_plugin(prepared, question):
     :rtype: `~.PluginEntryPoint`
 
     """
-    opts = [plugin_ep.description_with_name
-            + (" [Misconfigured]" if plugin_ep.misconfigured else "")
+    opts = [plugin_ep.description_with_name +
+            (" [Misconfigured]" if plugin_ep.misconfigured else "")
             for plugin_ep in prepared]
 
     while True:
@@ -62,7 +65,7 @@ def pick_plugin(config, default, plugins, question, ifaces):
         # throw more UX-friendly error if default not in plugins
         filtered = plugins.filter(lambda p_ep: p_ep.name == default)
     else:
-        filtered = plugins.ifaces(ifaces)
+        filtered = plugins.visible().ifaces(ifaces)
 
     filtered.init(config)
     verified = filtered.verify(ifaces)
@@ -70,7 +73,7 @@ def pick_plugin(config, default, plugins, question, ifaces):
     prepared = verified.available()
 
     if len(prepared) > 1:
-        logging.debug("Multiple candidate plugins: %s", prepared)
+        logger.debug("Multiple candidate plugins: %s", prepared)
         plugin_ep = choose_plugin(prepared.values(), question)
         if plugin_ep is None:
             return None
@@ -78,16 +81,18 @@ def pick_plugin(config, default, plugins, question, ifaces):
             return plugin_ep.init()
     elif len(prepared) == 1:
         plugin_ep = prepared.values()[0]
-        logging.debug("Single candidate plugin: %s", plugin_ep)
+        logger.debug("Single candidate plugin: %s", plugin_ep)
+        if plugin_ep.misconfigured:
+            return None
         return plugin_ep.init()
     else:
-        logging.debug("No candidate plugin")
+        logger.debug("No candidate plugin")
         return None
 
 
 def pick_authenticator(
         config, default, plugins, question="How would you "
-        "like to authenticate with Let's Encrypt CA?"):
+        "like to authenticate with the Let's Encrypt CA?"):
     """Pick authentication plugin."""
     return pick_plugin(
         config, default, plugins, question, (interfaces.IAuthenticator,))
@@ -110,6 +115,24 @@ def pick_configurator(
         (interfaces.IAuthenticator, interfaces.IInstaller))
 
 
+def get_email():
+    """Prompt for valid email address.
+
+    :returns: Email or ``None`` if cancelled by user.
+    :rtype: str
+
+    """
+    while True:
+        code, email = zope.component.getUtility(interfaces.IDisplay).input(
+            "Enter email address (used for urgent notices and lost key recovery)")
+
+        if code == display_util.OK:
+            if le_util.safe_email(email):
+                return email
+        else:
+            return None
+
+
 def choose_account(accounts):
     """Choose an account.
 
@@ -118,11 +141,7 @@ def choose_account(accounts):
 
     """
     # Note this will get more complicated once we start recording authorizations
-    labels = [
-        "%s | %s" % (acc.email.ljust(display_util.WIDTH - 39),
-                     acc.phone if acc.phone is not None else "")
-        for acc in accounts
-    ]
+    labels = [acc.slug for acc in accounts]
 
     code, index = util(interfaces.IDisplay).menu(
         "Please choose an account", labels)
@@ -143,7 +162,7 @@ def choose_names(installer):
 
     """
     if installer is None:
-        logging.debug("No installer, picking names manually")
+        logger.debug("No installer, picking names manually")
         return _choose_names_manually()
 
     names = list(installer.get_all_names())
@@ -205,8 +224,42 @@ def success_installation(domains):
 
     """
     util(interfaces.IDisplay).notification(
-        "Congratulations! You have successfully enabled "
-        "%s!" % _gen_https_names(domains), pause=False)
+        "Congratulations! You have successfully enabled {0}!{1}{1}"
+        "You should test your configuration at:{1}{2}".format(
+            _gen_https_names(domains),
+            os.linesep,
+            os.linesep.join(_gen_ssl_lab_urls(domains))),
+        height=(10 + len(domains)),
+        pause=False)
+
+
+def success_renewal(domains):
+    """Display a box confirming the renewal of an existing certificate.
+
+    .. todo:: This should be centered on the screen
+
+    :param list domains: domain names which were renewed
+
+    """
+    util(interfaces.IDisplay).notification(
+        "Your existing certificate has been successfully renewed, and the "
+        "new certificate has been installed.{1}{1}"
+        "The new certificate covers the following domains: {0}{1}{1}"
+        "You should test your configuration at:{1}{2}".format(
+            _gen_https_names(domains),
+            os.linesep,
+            os.linesep.join(_gen_ssl_lab_urls(domains))),
+        height=(14 + len(domains)),
+        pause=False)
+
+
+def _gen_ssl_lab_urls(domains):
+    """Returns a list of urls.
+
+    :param list domains: Each domain is a 'str'
+
+    """
+    return ["https://www.ssllabs.com/ssltest/analyze.html?d=%s" % dom for dom in domains]
 
 
 def _gen_https_names(domains):

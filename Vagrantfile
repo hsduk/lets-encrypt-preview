@@ -8,11 +8,9 @@ VAGRANTFILE_API_VERSION = "2"
 $ubuntu_setup_script = <<SETUP_SCRIPT
 cd /vagrant
 sudo ./bootstrap/ubuntu.sh
-sudo apt-get -y --no-install-recommends install git-core
-# the above is required by the 'git+https' lines of requirements.txt
 if [ ! -d "venv" ]; then
   virtualenv --no-site-packages -p python2 venv
-  ./venv/bin/pip install -r requirements.txt -e .[dev,docs,testing]
+  ./venv/bin/pip install -r requirements.txt -e acme -e .[dev,docs,testing] -e letsencrypt-apache -e letsencrypt-nginx
 fi
 SETUP_SCRIPT
 

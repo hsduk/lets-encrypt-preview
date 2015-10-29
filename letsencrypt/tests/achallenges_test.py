@@ -1,45 +1,33 @@
 """Tests for letsencrypt.achallenges."""
-import os
-import pkg_resources
-import re
 import unittest
 
-import M2Crypto
+import OpenSSL
 
 from acme import challenges
-from letsencrypt import le_util
+from acme import jose
+
 from letsencrypt.tests import acme_util
+from letsencrypt.tests import test_util
 
 
 class DVSNITest(unittest.TestCase):
     """Tests for letsencrypt.achallenges.DVSNI."""
 
     def setUp(self):
-        self.chall = acme_util.chall_to_challb(
-            challenges.DVSNI(r="r_value", nonce="12345ABCDE"), "pending")
-        self.response = challenges.DVSNIResponse()
-        key = le_util.Key("path", pkg_resources.resource_string(
-            "acme.jose", os.path.join("testdata", "rsa512_key.pem")))
-
+        self.challb = acme_util.chall_to_challb(acme_util.DVSNI, "pending")
+        key = jose.JWKRSA.load(test_util.load_vector("rsa512_key.pem"))
         from letsencrypt.achallenges import DVSNI
-        self.achall = DVSNI(challb=self.chall, domain="example.com", key=key)
+        self.achall = DVSNI(
+            challb=self.challb, domain="example.com", account_key=key)
 
     def test_proxy(self):
-        self.assertEqual(self.chall.r, self.achall.r)
-        self.assertEqual(self.chall.nonce, self.achall.nonce)
+        self.assertEqual(self.challb.token, self.achall.token)
 
     def test_gen_cert_and_response(self):
-        cert_pem, _ = self.achall.gen_cert_and_response(s=self.response.s)
-
-        cert = M2Crypto.X509.load_cert_string(cert_pem)
-        self.assertEqual(cert.get_subject().CN, self.chall.nonce_domain)
-
-        sans = cert.get_ext("subjectAltName").get_value()
-        self.assertEqual(
-            set([self.chall.nonce_domain, "example.com",
-                 self.response.z_domain(self.chall)]),
-            set(re.findall(r"DNS:([^, $]*)", sans)),
-        )
+        response, cert, key = self.achall.gen_cert_and_response()
+        self.assertTrue(isinstance(response, challenges.DVSNIResponse))
+        self.assertTrue(isinstance(cert, OpenSSL.crypto.X509))
+        self.assertTrue(isinstance(key, OpenSSL.crypto.PKey))
 
 
 if __name__ == "__main__":

@@ -1,15 +1,10 @@
+include requirements.txt
 include README.rst
 include CHANGES.rst
 include CONTRIBUTING.md
+include LICENSE.txt
 include linter_plugin.py
-include letsencrypt/EULA
+include letsencrypt/DISCLAIMER
+recursive-include docs *
+recursive-include examples *
 recursive-include letsencrypt/tests/testdata *
-
-recursive-include acme/schemata *.json
-recursive-include acme/jose/testdata *
-
-recursive-include letsencrypt_apache/tests/testdata *
-include letsencrypt_apache/options-ssl.conf
-
-recursive-include letsencrypt_nginx/tests/testdata *
-include letsencrypt_nginx/options-ssl.conf

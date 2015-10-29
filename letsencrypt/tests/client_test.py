@@ -1,128 +1,189 @@
 """Tests for letsencrypt.client."""
 import os
-import unittest
-import pkg_resources
 import shutil
 import tempfile
+import unittest
 
-import configobj
+import OpenSSL
 import mock
 
+from acme import jose
+
 from letsencrypt import account
-from letsencrypt import configuration
+from letsencrypt import errors
 from letsencrypt import le_util
 
+from letsencrypt.tests import test_util
 
-KEY = pkg_resources.resource_string(
-    __name__, os.path.join("testdata", "rsa512_key.pem"))
+
+KEY = test_util.load_vector("rsa512_key.pem")
+CSR_SAN = test_util.load_vector("csr-san.der")
+
+
+class RegisterTest(unittest.TestCase):
+    """Tests for letsencrypt.client.register."""
+
+    def setUp(self):
+        self.config = mock.MagicMock(rsa_key_size=1024)
+        self.account_storage = account.AccountMemoryStorage()
+        self.tos_cb = mock.MagicMock()
+
+    def _call(self):
+        from letsencrypt.client import register
+        return register(self.config, self.account_storage, self.tos_cb)
+
+    def test_no_tos(self):
+        with mock.patch("letsencrypt.client.acme_client.Client") as mock_client:
+            mock_client.register().terms_of_service = "http://tos"
+            with mock.patch("letsencrypt.account.report_new_account"):
+                self.tos_cb.return_value = False
+                self.assertRaises(errors.Error, self._call)
+
+                self.tos_cb.return_value = True
+                self._call()
+
+                self.tos_cb = None
+                self._call()
+
+    def test_it(self):
+        with mock.patch("letsencrypt.client.acme_client.Client"):
+            with mock.patch("letsencrypt.account."
+                            "report_new_account"):
+                self._call()
 
 
 class ClientTest(unittest.TestCase):
     """Tests for letsencrypt.client.Client."""
 
     def setUp(self):
-        self.config = mock.MagicMock(no_verify_ssl=False)
+        self.config = mock.MagicMock(
+            no_verify_ssl=False, config_dir="/etc/letsencrypt")
         # pylint: disable=star-args
         self.account = mock.MagicMock(**{"key.pem": KEY})
 
         from letsencrypt.client import Client
-        with mock.patch("letsencrypt.client.network2") as network2:
+        with mock.patch("letsencrypt.client.acme_client.Client") as acme:
+            self.acme_client = acme
+            self.acme = acme.return_value = mock.MagicMock()
             self.client = Client(
-                config=self.config, account_=self.account, dv_auth=None,
-                installer=None)
-        self.network2 = network2
+                config=self.config, account_=self.account,
+                dv_auth=None, installer=None)
 
-    def test_init_network_verify_ssl(self):
-        self.network2.Network.assert_called_once_with(
-            mock.ANY, mock.ANY, verify_ssl=True)
+    def test_init_acme_verify_ssl(self):
+        self.acme_client.assert_called_once_with(
+            directory=mock.ANY, key=mock.ANY, verify_ssl=True)
 
-    @mock.patch("letsencrypt.client.zope.component.getUtility")
-    def test_report_new_account(self, mock_zope):
-        # pylint: disable=protected-access
-        self.config.config_dir = "/usr/bin/coffee"
-        self.account.recovery_token = "ECCENTRIC INVISIBILITY RHINOCEROS"
-        self.account.email = "rhino@jungle.io"
+    def _mock_obtain_certificate(self):
+        self.client.auth_handler = mock.MagicMock()
+        self.acme.request_issuance.return_value = mock.sentinel.certr
+        self.acme.fetch_chain.return_value = mock.sentinel.chain
 
-        self.client._report_new_account()
-        call_list = mock_zope().add_message.call_args_list
-        self.assertTrue(self.config.config_dir in call_list[0][0][0])
-        self.assertTrue(self.account.recovery_token in call_list[1][0][0])
-        self.assertTrue(self.account.email in call_list[1][0][0])
+    def _check_obtain_certificate(self):
+        self.client.auth_handler.get_authorizations.assert_called_once_with(
+            ["example.com", "www.example.com"])
+        self.acme.request_issuance.assert_called_once_with(
+            jose.ComparableX509(OpenSSL.crypto.load_certificate_request(
+                OpenSSL.crypto.FILETYPE_ASN1, CSR_SAN)),
+            self.client.auth_handler.get_authorizations())
+        self.acme.fetch_chain.assert_called_once_with(mock.sentinel.certr)
 
-    @mock.patch("letsencrypt.client.zope.component.getUtility")
-    def test_report_renewal_status(self, mock_zope):
-        # pylint: disable=protected-access
-        cert = mock.MagicMock()
-        cert.configuration = configobj.ConfigObj()
-        cert.configuration["renewal_configs_dir"] = "/etc/letsencrypt/configs"
+    def test_obtain_certificate_from_csr(self):
+        self._mock_obtain_certificate()
+        self.assertEqual(
+            (mock.sentinel.certr, mock.sentinel.chain),
+            self.client.obtain_certificate_from_csr(le_util.CSR(
+                form="der", file=None, data=CSR_SAN)))
+        self._check_obtain_certificate()
 
-        cert.configuration["autorenew"] = "True"
-        cert.configuration["autodeploy"] = "True"
-        self.client._report_renewal_status(cert)
-        msg = mock_zope().add_message.call_args[0][0]
-        self.assertTrue("renewal and deployment has been" in msg)
-        self.assertTrue(cert.configuration["renewal_configs_dir"] in msg)
+    @mock.patch("letsencrypt.client.crypto_util")
+    def test_obtain_certificate(self, mock_crypto_util):
+        self._mock_obtain_certificate()
 
-        cert.configuration["autorenew"] = "False"
-        self.client._report_renewal_status(cert)
-        msg = mock_zope().add_message.call_args[0][0]
-        self.assertTrue("deployment but not automatic renewal" in msg)
-        self.assertTrue(cert.configuration["renewal_configs_dir"] in msg)
+        csr = le_util.CSR(form="der", file=None, data=CSR_SAN)
+        mock_crypto_util.init_save_csr.return_value = csr
+        mock_crypto_util.init_save_key.return_value = mock.sentinel.key
+        domains = ["example.com", "www.example.com"]
 
-        cert.configuration["autodeploy"] = "False"
-        self.client._report_renewal_status(cert)
-        msg = mock_zope().add_message.call_args[0][0]
-        self.assertTrue("renewal and deployment has not" in msg)
-        self.assertTrue(cert.configuration["renewal_configs_dir"] in msg)
+        self.assertEqual(
+            self.client.obtain_certificate(domains),
+            (mock.sentinel.certr, mock.sentinel.chain, mock.sentinel.key, csr))
 
-        cert.configuration["autorenew"] = "True"
-        self.client._report_renewal_status(cert)
-        msg = mock_zope().add_message.call_args[0][0]
-        self.assertTrue("renewal but not automatic deployment" in msg)
-        self.assertTrue(cert.configuration["renewal_configs_dir"] in msg)
+        mock_crypto_util.init_save_key.assert_called_once_with(
+            self.config.rsa_key_size, self.config.key_dir)
+        mock_crypto_util.init_save_csr.assert_called_once_with(
+            mock.sentinel.key, domains, self.config.csr_dir)
+        self._check_obtain_certificate()
 
-class DetermineAccountTest(unittest.TestCase):
-    """Tests for letsencrypt.client.determine_authenticator."""
+    def test_save_certificate(self):
+        certs = ["matching_cert.pem", "cert.pem", "cert-san.pem"]
+        tmp_path = tempfile.mkdtemp()
+        os.chmod(tmp_path, 0o755)  # TODO: really??
 
-    def setUp(self):
-        self.accounts_dir = tempfile.mkdtemp("accounts")
-        account_keys_dir = os.path.join(self.accounts_dir, "keys")
-        os.makedirs(account_keys_dir, 0o700)
+        certr = mock.MagicMock(body=test_util.load_cert(certs[0]))
+        chain_cert = [test_util.load_cert(certs[1]),
+                      test_util.load_cert(certs[2])]
+        candidate_cert_path = os.path.join(tmp_path, "certs", "cert.pem")
+        candidate_chain_path = os.path.join(tmp_path, "chains", "chain.pem")
+        candidate_fullchain_path = os.path.join(tmp_path, "chains", "fullchain.pem")
 
-        self.config = mock.MagicMock(
-            spec=configuration.NamespaceConfig, accounts_dir=self.accounts_dir,
-            account_keys_dir=account_keys_dir, rsa_key_size=2048,
-            server="letsencrypt-demo.org")
+        cert_path, chain_path, fullchain_path = self.client.save_certificate(
+            certr, chain_cert, candidate_cert_path, candidate_chain_path,
+            candidate_fullchain_path)
 
-    def tearDown(self):
-        shutil.rmtree(self.accounts_dir)
+        self.assertEqual(os.path.dirname(cert_path),
+                         os.path.dirname(candidate_cert_path))
+        self.assertEqual(os.path.dirname(chain_path),
+                         os.path.dirname(candidate_chain_path))
+        self.assertEqual(os.path.dirname(fullchain_path),
+                         os.path.dirname(candidate_fullchain_path))
 
-    @mock.patch("letsencrypt.account.Account.from_prompts")
-    @mock.patch("letsencrypt.client.display_ops.choose_account")
-    def test_determine_account(self, mock_op, mock_prompt):
-        """Test determine account"""
-        from letsencrypt import client
+        with open(cert_path, "r") as cert_file:
+            cert_contents = cert_file.read()
+        self.assertEqual(cert_contents, test_util.load_vector(certs[0]))
 
-        key = le_util.Key(tempfile.mkstemp()[1], "pem")
-        test_acc = account.Account(self.config, key, "email1@gmail.com")
-        mock_op.return_value = test_acc
+        with open(chain_path, "r") as chain_file:
+            chain_contents = chain_file.read()
+        self.assertEqual(chain_contents, test_util.load_vector(certs[1]) +
+                         test_util.load_vector(certs[2]))
 
-        # Test 0
-        mock_prompt.return_value = None
-        self.assertTrue(client.determine_account(self.config) is None)
+        shutil.rmtree(tmp_path)
 
-        # Test 1
-        test_acc.save()
-        acc = client.determine_account(self.config)
-        self.assertEqual(acc.email, test_acc.email)
+    def test_deploy_certificate(self):
+        self.assertRaises(errors.Error, self.client.deploy_certificate,
+                          ["foo.bar"], "key", "cert", "chain", "fullchain")
 
-        # Test multiple
-        self.assertFalse(mock_op.called)
-        acc2 = account.Account(self.config, key)
-        acc2.save()
-        chosen_acc = client.determine_account(self.config)
-        self.assertTrue(mock_op.called)
-        self.assertTrue(chosen_acc.email, test_acc.email)
+        installer = mock.MagicMock()
+        self.client.installer = installer
+
+        self.client.deploy_certificate(
+            ["foo.bar"], "key", "cert", "chain", "fullchain")
+        installer.deploy_cert.assert_called_once_with(
+            cert_path=os.path.abspath("cert"),
+            chain_path=os.path.abspath("chain"),
+            domain='foo.bar',
+            fullchain_path='fullchain',
+            key_path=os.path.abspath("key"))
+        self.assertEqual(installer.save.call_count, 1)
+        installer.restart.assert_called_once_with()
+
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config(self, mock_enhancements):
+        self.assertRaises(errors.Error,
+                          self.client.enhance_config, ["foo.bar"])
+
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+
+        self.client.enhance_config(["foo.bar"])
+        installer.enhance.assert_called_once_with("foo.bar", "redirect")
+        self.assertEqual(installer.save.call_count, 1)
+        installer.restart.assert_called_once_with()
+
+        installer.enhance.side_effect = errors.PluginError
+        self.assertRaises(errors.PluginError,
+                          self.client.enhance_config, ["foo.bar"], True)
+        installer.recovery_routine.assert_called_once_with()
 
 
 class RollbackTest(unittest.TestCase):
@@ -145,7 +206,7 @@ class RollbackTest(unittest.TestCase):
         self.assertEqual(self.m_install().restart.call_count, 1)
 
     def test_no_installer(self):
-        self._call(1, None) # Just make sure no exceptions are raised
+        self._call(1, None)  # Just make sure no exceptions are raised
 
 
 if __name__ == "__main__":

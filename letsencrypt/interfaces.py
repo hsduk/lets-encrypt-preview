@@ -1,8 +1,44 @@
 """Let's Encrypt client interfaces."""
+import abc
 import zope.interface
 
 # pylint: disable=no-self-argument,no-method-argument,no-init,inherit-non-class
 # pylint: disable=too-few-public-methods
+
+
+class AccountStorage(object):
+    """Accounts storage interface."""
+
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def find_all(self):  # pragma: no cover
+        """Find all accounts.
+
+        :returns: All found accounts.
+        :rtype: list
+
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def load(self, account_id):  # pragma: no cover
+        """Load an account by its id.
+
+        :raises .AccountNotFound: if account could not be found
+        :raises .AccountStorageError: if account could not be loaded
+
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def save(self, account):  # pragma: no cover
+        """Save account.
+
+        :raises .AccountStorageError: if account could not be saved
+
+        """
+        raise NotImplementedError()
 
 
 class IPluginFactory(zope.interface.Interface):
@@ -66,14 +102,19 @@ class IPlugin(zope.interface.Interface):
     def prepare():
         """Prepare the plugin.
 
-         Finish up any additional initialization.
+        Finish up any additional initialization.
 
-         :raises letsencrypt.errors.LetsEncryptMisconfigurationError:
-             when full initialization cannot be completed. Plugin will be
-             displayed on a list of available plugins.
-         :raises letsencrypt.errors.LetsEncryptNoInstallationError:
-             when the necessary programs/files cannot be located. Plugin
-             will NOT be displayed on a list of available plugins.
+        :raises .PluginError:
+            when full initialization cannot be completed.
+        :raises .MisconfigurationError:
+            when full initialization cannot be completed. Plugin will
+            be displayed on a list of available plugins.
+        :raises .NoInstallationError:
+            when the necessary programs/files cannot be located. Plugin
+            will NOT be displayed on a list of available plugins.
+        :raises .NotSupportedError:
+            when the installation is recognized, but the version is not
+            currently supported.
 
         """
 
@@ -82,6 +123,8 @@ class IPlugin(zope.interface.Interface):
 
         Should describe the steps taken and any relevant info to help the user
         decide which plugin to use.
+
+        :rtype str:
 
         """
 
@@ -99,7 +142,7 @@ class IAuthenticator(IPlugin):
 
         :param str domain: Domain for which challenge preferences are sought.
 
-        :returns: List of challege types (subclasses of
+        :returns: List of challenge types (subclasses of
             :class:`acme.challenges.Challenge`) with the most
             preferred challenges first. If a type is not specified, it means the
             Authenticator cannot perform the challenge.
@@ -128,6 +171,8 @@ class IAuthenticator(IPlugin):
         :rtype: :class:`list` of
             :class:`acme.challenges.ChallengeResponse`
 
+        :raises .PluginError: If challenges cannot be performed
+
         """
 
     def cleanup(achalls):
@@ -136,6 +181,8 @@ class IAuthenticator(IPlugin):
         :param list achalls: Non-empty (guaranteed) list of
             :class:`~letsencrypt.achallenges.AnnotatedChallenge`
             instances, a subset of those previously passed to :func:`perform`.
+
+        :raises PluginError: if original configuration cannot be restored
 
         """
 
@@ -147,46 +194,37 @@ class IConfig(zope.interface.Interface):
         filtered, stripped or sanitized.
 
     """
-    server = zope.interface.Attribute(
-        "CA hostname (and optionally :port). The server certificate must "
-        "be trusted in order to avoid further modifications to the client.")
+    server = zope.interface.Attribute("ACME Directory Resource URI.")
     email = zope.interface.Attribute(
         "Email used for registration and recovery contact.")
     rsa_key_size = zope.interface.Attribute("Size of the RSA key.")
 
     config_dir = zope.interface.Attribute("Configuration directory.")
     work_dir = zope.interface.Attribute("Working directory.")
-    backup_dir = zope.interface.Attribute("Configuration backups directory.")
-    temp_checkpoint_dir = zope.interface.Attribute(
-        "Temporary checkpoint directory.")
-    in_progress_dir = zope.interface.Attribute(
-        "Directory used before a permanent checkpoint is finalized.")
-    cert_key_backup = zope.interface.Attribute(
-        "Directory where all certificates and keys are stored. "
-        "Used for easy revocation.")
+
     accounts_dir = zope.interface.Attribute(
         "Directory where all account information is stored.")
-    account_keys_dir = zope.interface.Attribute(
-        "Directory where all account keys are stored.")
-    rec_token_dir = zope.interface.Attribute(
-        "Directory where all recovery tokens are saved.")
+    backup_dir = zope.interface.Attribute("Configuration backups directory.")
+    csr_dir = zope.interface.Attribute(
+        "Directory where newly generated Certificate Signing Requests "
+        "(CSRs) are saved.")
+    in_progress_dir = zope.interface.Attribute(
+        "Directory used before a permanent checkpoint is finalized.")
     key_dir = zope.interface.Attribute("Keys storage.")
-    cert_dir = zope.interface.Attribute("Certificates storage.")
-
-    le_vhost_ext = zope.interface.Attribute(
-        "SSL vhost configuration extension.")
+    temp_checkpoint_dir = zope.interface.Attribute(
+        "Temporary checkpoint directory.")
 
     renewer_config_file = zope.interface.Attribute(
         "Location of renewal configuration file.")
-
-    cert_path = zope.interface.Attribute("Let's Encrypt certificate file path.")
-    chain_path = zope.interface.Attribute("Let's Encrypt chain file path.")
 
     no_verify_ssl = zope.interface.Attribute(
         "Disable SSL certificate verification.")
     dvsni_port = zope.interface.Attribute(
         "Port number to perform DVSNI challenge. "
         "Boulder in testing mode defaults to 5001.")
+
+    simple_http_port = zope.interface.Attribute(
+        "Port used in the SimpleHttp challenge.")
 
 
 class IInstaller(IPlugin):
@@ -197,15 +235,23 @@ class IInstaller(IPlugin):
     """
 
     def get_all_names():
-        """Returns all names that may be authenticated."""
+        """Returns all names that may be authenticated.
 
-    def deploy_cert(domain, cert_path, key_path, chain_path=None):
+        :rtype: `list` of `str`
+
+        """
+
+    def deploy_cert(domain, cert_path, key_path, chain_path, fullchain_path):
         """Deploy certificate.
 
         :param str domain: domain to deploy certificate file
         :param str cert_path: absolute path to the certificate file
         :param str key_path: absolute path to the private key file
         :param str chain_path: absolute path to the certificate chain file
+        :param str fullchain_path: absolute path to the certificate fullchain
+            file (cert plus chain)
+
+        :raises .PluginError: when cert cannot be deployed
 
         """
 
@@ -219,6 +265,9 @@ class IInstaller(IPlugin):
             Check documentation of
             :const:`~letsencrypt.constants.ENHANCEMENTS`
             for expected options for each enhancement.
+
+        :raises .PluginError: If Enhancement is not supported, or if
+            an error occurs during the enhancement.
 
         """
 
@@ -258,19 +307,48 @@ class IInstaller(IPlugin):
         :param bool temporary: Indicates whether the changes made will
             be quickly reversed in the future (challenges)
 
+        :raises .PluginError: when save is unsuccessful
+
         """
 
     def rollback_checkpoints(rollback=1):
-        """Revert `rollback` number of configuration checkpoints."""
+        """Revert `rollback` number of configuration checkpoints.
+
+        :raises .PluginError: when configuration cannot be fully reverted
+
+        """
+
+    def recovery_routine():
+        """Revert configuration to most recent finalized checkpoint.
+
+        Remove all changes (temporary and permanent) that have not been
+        finalized. This is useful to protect against crashes and other
+        execution interruptions.
+
+        :raises .errors.PluginError: If unable to recover the configuration
+
+        """
 
     def view_config_changes():
-        """Display all of the LE config changes."""
+        """Display all of the LE config changes.
+
+        :raises .PluginError: when config changes cannot be parsed
+
+        """
 
     def config_test():
-        """Make sure the configuration is valid."""
+        """Make sure the configuration is valid.
+
+        :raises .MisconfigurationError: when the config is not in a usable state
+
+        """
 
     def restart():
-        """Restart or refresh the server content."""
+        """Restart or refresh the server content.
+
+        :raises .PluginError: when server cannot be restarted
+
+        """
 
 
 class IDisplay(zope.interface.Interface):
@@ -343,17 +421,51 @@ class IDisplay(zope.interface.Interface):
 class IValidator(zope.interface.Interface):
     """Configuration validator."""
 
-    def redirect(name):
-        """Verify redirect to HTTPS."""
+    def certificate(cert, name, alt_host=None, port=443):
+        """Verifies the certificate presented at name is cert
 
-    def ocsp_stapling(name):
-        """Verify ocsp stapling for domain."""
+        :param OpenSSL.crypto.X509 cert: Expected certificate
+        :param str name: Server's domain name
+        :param bytes alt_host: Host to connect to instead of the IP
+            address of host
+        :param int port: Port to connect to
 
-    def https(names):
-        """Verify HTTPS is enabled for domain."""
+        :returns: True if the certificate was verified successfully
+        :rtype: bool
+
+        """
+
+    def redirect(name, port=80, headers=None):
+        """Verify redirect to HTTPS
+
+        :param str name: Server's domain name
+        :param int port: Port to connect to
+        :param dict headers: HTTP headers to include in request
+
+        :returns: True if redirect is successfully enabled
+        :rtype: bool
+
+        """
 
     def hsts(name):
-        """Verify HSTS header is enabled."""
+        """Verify HSTS header is enabled
+
+        :param str name: Server's domain name
+
+        :returns: True if HSTS header is successfully enabled
+        :rtype: bool
+
+        """
+
+    def ocsp_stapling(name):
+        """Verify ocsp stapling for domain
+
+        :param str name: Server's domain name
+
+        :returns: True if ocsp stapling is successfully enabled
+        :rtype: bool
+
+        """
 
 
 class IReporter(zope.interface.Interface):
@@ -366,7 +478,7 @@ class IReporter(zope.interface.Interface):
     LOW_PRIORITY = zope.interface.Attribute(
         "Used to denote low priority messages")
 
-    def add_message(self, msg, priority, on_crash=False):
+    def add_message(self, msg, priority, on_crash=True):
         """Adds msg to the list of messages to be printed.
 
         :param str msg: Message to be displayed to the user.

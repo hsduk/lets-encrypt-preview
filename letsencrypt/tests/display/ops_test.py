@@ -7,11 +7,18 @@ import unittest
 import mock
 import zope.component
 
+from acme import jose
+from acme import messages
+
 from letsencrypt import account
 from letsencrypt import interfaces
-from letsencrypt import le_util
 
 from letsencrypt.display import util as display_util
+
+from letsencrypt.tests import test_util
+
+
+KEY = jose.JWKRSA.load(test_util.load_vector("rsa512_key.pem"))
 
 
 class ChoosePluginTest(unittest.TestCase):
@@ -73,11 +80,11 @@ class PickPluginTest(unittest.TestCase):
     def test_default_provided(self):
         self.default = "foo"
         self._call()
-        self.reg.filter.assert_called_once()
+        self.assertEqual(1, self.reg.filter.call_count)
 
     def test_no_default(self):
         self._call()
-        self.reg.filter.assert_called_once()
+        self.assertEqual(1, self.reg.visible().ifaces.call_count)
 
     def test_no_candidate(self):
         self.assertTrue(self._call() is None)
@@ -85,13 +92,25 @@ class PickPluginTest(unittest.TestCase):
     def test_single(self):
         plugin_ep = mock.MagicMock()
         plugin_ep.init.return_value = "foo"
-        self.reg.ifaces().verify().available.return_value = {"bar": plugin_ep}
+        plugin_ep.misconfigured = False
+
+        self.reg.visible().ifaces().verify().available.return_value = {
+            "bar": plugin_ep}
         self.assertEqual("foo", self._call())
+
+    def test_single_misconfigured(self):
+        plugin_ep = mock.MagicMock()
+        plugin_ep.init.return_value = "foo"
+        plugin_ep.misconfigured = True
+
+        self.reg.visible().ifaces().verify().available.return_value = {
+            "bar": plugin_ep}
+        self.assertTrue(self._call() is None)
 
     def test_multiple(self):
         plugin_ep = mock.MagicMock()
         plugin_ep.init.return_value = "foo"
-        self.reg.ifaces().verify().available.return_value = {
+        self.reg.visible().ifaces().verify().available.return_value = {
             "bar": plugin_ep,
             "baz": plugin_ep,
         }
@@ -102,7 +121,7 @@ class PickPluginTest(unittest.TestCase):
             [plugin_ep, plugin_ep], self.question)
 
     def test_choose_plugin_none(self):
-        self.reg.ifaces().verify().available.return_value = {
+        self.reg.visible().ifaces().verify().available.return_value = {
             "bar": None,
             "baz": None,
         }
@@ -140,8 +159,40 @@ class ConveniencePickPluginTest(unittest.TestCase):
             interfaces.IAuthenticator, interfaces.IInstaller))
 
 
+class GetEmailTest(unittest.TestCase):
+    """Tests for letsencrypt.display.ops.get_email."""
+
+    def setUp(self):
+        mock_display = mock.MagicMock()
+        self.input = mock_display.input
+        zope.component.provideUtility(mock_display, interfaces.IDisplay)
+
+    @classmethod
+    def _call(cls):
+        from letsencrypt.display.ops import get_email
+        return get_email()
+
+    def test_cancel_none(self):
+        self.input.return_value = (display_util.CANCEL, "foo@bar.baz")
+        self.assertTrue(self._call() is None)
+
+    def test_ok_safe(self):
+        self.input.return_value = (display_util.OK, "foo@bar.baz")
+        with mock.patch("letsencrypt.display.ops.le_util"
+                        ".safe_email") as mock_safe_email:
+            mock_safe_email.return_value = True
+            self.assertTrue(self._call() is "foo@bar.baz")
+
+    def test_ok_not_safe(self):
+        self.input.return_value = (display_util.OK, "foo@bar.baz")
+        with mock.patch("letsencrypt.display.ops.le_util"
+                        ".safe_email") as mock_safe_email:
+            mock_safe_email.side_effect = [False, True]
+            self.assertTrue(self._call() is "foo@bar.baz")
+
+
 class ChooseAccountTest(unittest.TestCase):
-    """Test choose_account."""
+    """Tests for letsencrypt.display.ops.choose_account."""
     def setUp(self):
         zope.component.provideUtility(display_util.FileDisplay(sys.stdout))
 
@@ -153,13 +204,14 @@ class ChooseAccountTest(unittest.TestCase):
             accounts_dir=self.accounts_dir,
             account_keys_dir=self.account_keys_dir,
             server="letsencrypt-demo.org")
-        self.key = le_util.Key("keypath", "pem")
+        self.key = KEY
 
-        self.acc1 = account.Account(self.config, self.key, "email1@g.com")
-        self.acc2 = account.Account(
-            self.config, self.key, "email2@g.com", "phone")
-        self.acc1.save()
-        self.acc2.save()
+        self.acc1 = account.Account(messages.RegistrationResource(
+            uri=None, new_authzr_uri=None, body=messages.Registration.from_data(
+                email="email1@g.com")), self.key)
+        self.acc2 = account.Account(messages.RegistrationResource(
+            uri=None, new_authzr_uri=None, body=messages.Registration.from_data(
+                email="email2@g.com", phone="phone")), self.key)
 
     @classmethod
     def _call(cls, accounts):
@@ -180,6 +232,25 @@ class ChooseAccountTest(unittest.TestCase):
     def test_cancel(self, mock_util):
         mock_util().menu.return_value = (display_util.CANCEL, 1)
         self.assertTrue(self._call([self.acc1, self.acc2]) is None)
+
+
+class GenSSLLabURLs(unittest.TestCase):
+    """Loose test of _gen_ssl_lab_urls. URL can change easily in the future."""
+    def setUp(self):
+        zope.component.provideUtility(display_util.FileDisplay(sys.stdout))
+
+    @classmethod
+    def _call(cls, domains):
+        from letsencrypt.display.ops import _gen_ssl_lab_urls
+        return _gen_ssl_lab_urls(domains)
+
+    def test_zero(self):
+        self.assertEqual(self._call([]), [])
+
+    def test_two(self):
+        urls = self._call(["eff.org", "umich.edu"])
+        self.assertTrue("eff.org" in urls[0])
+        self.assertTrue("umich.edu" in urls[1])
 
 
 class GenHttpsNamesTest(unittest.TestCase):
@@ -303,6 +374,28 @@ class SuccessInstallationTest(unittest.TestCase):
 
     @mock.patch("letsencrypt.display.ops.util")
     def test_success_installation(self, mock_util):
+        mock_util().notification.return_value = None
+        names = ["example.com", "abc.com"]
+
+        self._call(names)
+
+        self.assertEqual(mock_util().notification.call_count, 1)
+        arg = mock_util().notification.call_args_list[0][0][0]
+
+        for name in names:
+            self.assertTrue(name in arg)
+
+
+class SuccessRenewalTest(unittest.TestCase):
+    # pylint: disable=too-few-public-methods
+    """Test the success renewal message."""
+    @classmethod
+    def _call(cls, names):
+        from letsencrypt.display.ops import success_renewal
+        success_renewal(names)
+
+    @mock.patch("letsencrypt.display.ops.util")
+    def test_success_renewal(self, mock_util):
         mock_util().notification.return_value = None
         names = ["example.com", "abc.com"]
 
